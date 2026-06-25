@@ -45,7 +45,6 @@ from chatbot import (
     DD_HEADERS,
 )
 
-from ddtrace import tracer
 from ddtrace.llmobs import LLMObs
 
 # ── Configure ddtrace tracer tags (service / env / version) ──
@@ -353,27 +352,13 @@ if user_input:
 
         start_time = time.time()
         try:
-            with tracer.trace(
-                'chatbot.user_turn',
-                service=os.environ['DD_SERVICE'],
-                resource=user_input[:120],
-            ) as span:
-                span.set_tags({
-                    **SPAN_TAGS,
-                    'user.message_length': str(len(user_input)),
-                    'session.history_len': str(len(st.session_state.chat_messages)),
-                })
-                reply = agent_turn(
-                    user_input,
-                    st.session_state.conversation,
-                    mcp_client,
-                    dd_tools,
-                    tool_log_callback=on_tool_call,
-                )
-                span.set_tag('response.length',    str(len(reply)))
-                span.set_tag('tools.calls_made',   str(len(tool_calls_this_turn)))
-                span.set_tag('tools.names',        ','.join(tc['name'] for tc in tool_calls_this_turn))
-
+            reply = agent_turn(
+                user_input,
+                st.session_state.conversation,
+                mcp_client,
+                dd_tools,
+                tool_log_callback=on_tool_call,
+            )
         except requests.HTTPError as e:
             reply = f'⚠️ Datadog MCP error: {e}'
         except Exception as e:

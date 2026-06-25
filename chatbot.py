@@ -184,6 +184,26 @@ def _build_bedrock_payload(messages: list, tools: list) -> dict:
 @llm(model_name='nova-micro', model_provider='bedrock')
 def call_bedrock(messages: list, tools: list) -> dict:
     """Single Bedrock invocation with optional guardrail applied."""
+    body_payload = _build_bedrock_payload(messages, tools)
+
+    response = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        body=json.dumps(body_payload),
+        contentType='application/json',
+    )
+    body = json.loads(response['body'].read())
+
+    # ── Guardrail intervention check ─────────────────────────
+    guardrail_action = body.get('amazon-bedrock-guardrailAction', 'NONE')
+    if guardrail_action == 'INTERVENED':
+        body.setdefault('output', {}).setdefault('message', {})['content'] = [
+            {'text': '⚠️ My response was blocked by a content guardrail. Please rephrase your question.'}
+        ]
+        body['stopReason'] = 'end_turn'
+
+    text_output = extract_text(body['output']['message']['content'])
+
+    # Single annotate call with both input and output — avoids lost-span errors
     LLMObs.annotate(
         input_data=[
             {
@@ -196,39 +216,13 @@ def call_bedrock(messages: list, tools: list) -> dict:
             }
             for m in messages
         ],
-        tags={
-            **SPAN_TAGS,
-            'llm.model':    MODEL_ID,
-            'llm.provider': 'bedrock',
-        },
-    )
-
-    body_payload = _build_bedrock_payload(messages, tools)
-
-    response = bedrock.invoke_model(
-        modelId=MODEL_ID,
-        body=json.dumps(body_payload),
-        contentType='application/json',
-    )
-    body = json.loads(response['body'].read())
-
-    # ── Guardrail intervention check ─────────────────────────
-    # If the guardrail blocked or altered the response, tag the span so it
-    # is visible in Datadog and surface a safe fallback message.
-    guardrail_action = body.get('amazon-bedrock-guardrailAction', 'NONE')
-    if guardrail_action == 'INTERVENED':
-        body.setdefault('output', {}).setdefault('message', {})['content'] = [
-            {'text': '⚠️ My response was blocked by a content guardrail. Please rephrase your question.'}
-        ]
-        body['stopReason'] = 'end_turn'
-
-    text_output = extract_text(body['output']['message']['content'])
-    LLMObs.annotate(
         output_data=[{'role': 'assistant', 'content': text_output or '[tool_use]'}],
         tags={
             **SPAN_TAGS,
-            'llm.stop_reason':       body.get('stopReason', 'unknown'),
-            'guardrail.action':      guardrail_action,
+            'llm.model':        MODEL_ID,
+            'llm.provider':     'bedrock',
+            'llm.stop_reason':  body.get('stopReason', 'unknown'),
+            'guardrail.action': guardrail_action,
         },
     )
     return body
@@ -237,14 +231,12 @@ def call_bedrock(messages: list, tools: list) -> dict:
 @tool
 def execute_mcp_tool(client: DatadogMCPClient, name: str, args: dict) -> str:
     """Execute one Datadog MCP tool and return its text output."""
+    output = client.call_tool(name, args)
+    # Single annotate with both input and output after the call completes
     LLMObs.annotate(
         input_data=json.dumps(args, indent=2),
-        tags={**SPAN_TAGS, 'tool.name': name, 'tool.source': 'datadog_mcp'},
-    )
-    output = client.call_tool(name, args)
-    LLMObs.annotate(
         output_data=output,
-        tags={**SPAN_TAGS, 'tool.name': name, 'tool.status': 'success'},
+        tags={**SPAN_TAGS, 'tool.name': name, 'tool.source': 'datadog_mcp'},
     )
     return output
 
@@ -285,15 +277,6 @@ def agent_turn(
     Returns:
         The assistant's final text response.
     """
-    LLMObs.annotate(
-        input_data=user_message,
-        tags={
-            **SPAN_TAGS,
-            'session.turn':  str(len([m for m in conversation if m['role'] == 'user'])),
-            'session.tools': str(len(dd_tools)),
-        },
-    )
-
     conversation.append({'role': 'user', 'content': [{'text': user_message}]})
     final_answer = ''
 
@@ -331,8 +314,15 @@ def agent_turn(
             final_answer = format_reply(content)
             break
 
+    # Single annotate at turn completion with full input/output + session tags
     LLMObs.annotate(
+        input_data=user_message,
         output_data=final_answer,
-        tags={**SPAN_TAGS, 'workflow.status': 'complete'},
+        tags={
+            **SPAN_TAGS,
+            'session.turn':    str(len([m for m in conversation if m['role'] == 'user'])),
+            'session.tools':   str(len(dd_tools)),
+            'workflow.status': 'complete',
+        },
     )
     return final_answer
