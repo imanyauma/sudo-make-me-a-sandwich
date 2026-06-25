@@ -10,10 +10,16 @@ Datadog tagging strategy:
 
 These propagate to every LLM span, tool span, workflow span, and
 trace so all telemetry is filterable in the DD UI by environment.
+
+NOTE: All agent logic (LLMObs-decorated functions, DatadogMCPClient) lives in
+chatbot.py and is imported here. This is intentional — ddtrace decorators must
+be registered exactly once in a single module. Redefining them in app.py causes
+"No active LLMObs-generated span found" errors because the span context created
+by the decorator in one module is not visible when LLMObs.annotate() is called
+inside the same decorator re-registered in another module.
 """
 
 import os
-import json
 import time
 import requests
 import streamlit as st
@@ -23,15 +29,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Datadog unified service tagging ──────────────────────────
-# Set before ddtrace initialises so every span inherits them.
-os.environ.setdefault('DD_SERVICE',  'incident-aiops')
-os.environ.setdefault('DD_ENV',      os.environ.get('DD_ENV', 'dev'))
-os.environ.setdefault('DD_VERSION',  '1.0.0')
+# Must be set before ddtrace is imported (happens inside chatbot.py imports).
+os.environ.setdefault('DD_SERVICE', 'incident-aiops')
+os.environ.setdefault('DD_ENV',     os.environ.get('DD_ENV', 'dev'))
+os.environ.setdefault('DD_VERSION', '1.0.0')
 
-import boto3
+# ── Import agent core from chatbot.py (single decoration point) ──
+from chatbot import (
+    agent_turn,
+    DatadogMCPClient,
+    build_system_prompt,
+    ALLOWED_TOOLS,
+    MODEL_ID,
+    DD_MCP_URL,
+    DD_HEADERS,
+)
+
 from ddtrace import tracer
 from ddtrace.llmobs import LLMObs
-from ddtrace.llmobs.decorators import llm, tool, workflow, task
 
 # ── Configure ddtrace tracer tags (service / env / version) ──
 tracer.set_tags({
@@ -53,25 +68,7 @@ if not LLMObs._instance:
         site=os.environ.get('DD_SITE', 'datadoghq.com'),
     )
 
-# ── AWS Bedrock client ────────────────────────────────────────
-bedrock = boto3.client('bedrock-runtime', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-
-# ── Constants ─────────────────────────────────────────────────
-MODEL_ID    = 'amazon.nova-micro-v1:0'
-DD_MCP_URL  = 'https://mcp.datadoghq.com/api/unstable/mcp-server/mcp'
-DD_HEADERS  = {
-    'Content-Type':   'application/json',
-    'DD-API-KEY':     os.environ['DD_API_KEY'],
-    'DD-APPLICATION-KEY': os.environ['DD_APP_KEY'],
-}
-ALLOWED_TOOLS = {
-    'search_datadog_monitors',
-    'get_apm_traces',
-    'get_apm_trace_details',
-    'list_apm_services',
-}
-
-# ── Common span tags applied to every manual annotation ───────
+# ── Common span tags ──────────────────────────────────────────
 SPAN_TAGS = {
     'env':           os.environ['DD_ENV'],
     'service':       os.environ['DD_SERVICE'],
@@ -81,218 +78,6 @@ SPAN_TAGS = {
     'model.id':      MODEL_ID,
     'interface':     'streamlit',
 }
-
-
-# ─────────────────────────────────────────────────────────────
-# Datadog MCP Client
-# ─────────────────────────────────────────────────────────────
-class DatadogMCPClient:
-    def __init__(self):
-        self._id = 0
-        self._session_id = None
-
-    def _post(self, method: str, params: dict = None) -> dict:
-        self._id += 1
-        payload = {
-            'jsonrpc': '2.0',
-            'id': self._id,
-            'method': method,
-            'params': params or {},
-        }
-        headers = {**DD_HEADERS, 'Accept': 'application/json, text/event-stream'}
-        if self._session_id:
-            headers['Mcp-Session-Id'] = self._session_id
-        response = requests.post(DD_MCP_URL, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        if 'Mcp-Session-Id' in response.headers:
-            self._session_id = response.headers['Mcp-Session-Id']
-        return response.json()
-
-    def initialize(self):
-        self._post('initialize', {
-            'protocolVersion': '2024-11-05',
-            'capabilities': {},
-            'clientInfo': {'name': 'incident-aiops-ui', 'version': '1.0'},
-        })
-
-    def list_tools(self) -> list:
-        result = self._post('tools/list')
-        return result.get('result', {}).get('tools', [])
-
-    def call_tool(self, name: str, arguments: dict) -> str:
-        result = self._post('tools/call', {'name': name, 'arguments': arguments})
-        content = result.get('result', {}).get('content', [])
-        return content[0].get('text', '') if content else ''
-
-
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
-def extract_text(content: list) -> str:
-    return '\n'.join(b['text'] for b in content if b.get('text')).strip()
-
-
-def build_system_prompt() -> str:
-    return (
-        'You are Sudo Make (Me A) Sandwich, an AIOps assistant with direct access to Datadog. '
-        'You specialise in two areas:\n'
-        '1. Monitors & Alerts — summarising firing monitors, their severity, '
-        'and recommended investigation order.\n'
-        '2. Traces — analysing APM traces, identifying slow services, errors, '
-        'and latency hotspots.\n\n'
-        'Always use the available Datadog tools to fetch live data before answering. '
-        'Be concise, use bullet points, and highlight the most critical issues first. '
-        'When asked to prioritise, consider alert severity, impacted services, and error rates.'
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# Agent core (decorated with ddtrace spans + env/service tags)
-# ─────────────────────────────────────────────────────────────
-@llm(model_name='nova-micro', model_provider='bedrock')
-def call_bedrock(messages: list, tools: list) -> dict:
-    LLMObs.annotate(
-        input_data=[
-            {
-                'role': m['role'],
-                'content': (
-                    extract_text(m['content'])
-                    if isinstance(m['content'], list)
-                    else json.dumps(m['content'])
-                ),
-            }
-            for m in messages
-        ],
-        tags={
-            **SPAN_TAGS,
-            'llm.model':    MODEL_ID,
-            'llm.provider': 'bedrock',
-        },
-    )
-
-    body_payload: dict = {
-        'messages': messages,
-        'inferenceConfig': {'max_new_tokens': 2048},
-    }
-    if tools:
-        body_payload['toolConfig'] = {
-            'tools': [
-                {
-                    'toolSpec': {
-                        'name': t['name'],
-                        'description': t.get('description', ''),
-                        'inputSchema': {'json': t['input_schema']},
-                    }
-                }
-                for t in tools
-            ]
-        }
-
-    response = bedrock.invoke_model(
-        modelId=MODEL_ID,
-        body=json.dumps(body_payload),
-        contentType='application/json',
-    )
-    body = json.loads(response['body'].read())
-    text_output = extract_text(body['output']['message']['content'])
-    LLMObs.annotate(
-        output_data=[{'role': 'assistant', 'content': text_output or '[tool_use]'}],
-        tags={**SPAN_TAGS, 'llm.stop_reason': body.get('stopReason', 'unknown')},
-    )
-    return body
-
-
-@tool
-def execute_mcp_tool(client: DatadogMCPClient, name: str, args: dict) -> str:
-    LLMObs.annotate(
-        input_data=json.dumps(args, indent=2),
-        tags={
-            **SPAN_TAGS,
-            'tool.name':   name,
-            'tool.source': 'datadog_mcp',
-        },
-    )
-    output = client.call_tool(name, args)
-    LLMObs.annotate(
-        output_data=output,
-        tags={**SPAN_TAGS, 'tool.name': name, 'tool.status': 'success'},
-    )
-    return output
-
-
-@task
-def format_reply(content: list) -> str:
-    text = extract_text(content)
-    LLMObs.annotate(
-        input_data=json.dumps(content, indent=2),
-        output_data=text,
-        tags={**SPAN_TAGS, 'task.name': 'format_reply'},
-    )
-    return text
-
-
-@workflow
-def agent_turn(
-    user_message: str,
-    conversation: list,
-    mcp_client: DatadogMCPClient,
-    dd_tools: list,
-    tool_log_callback=None,
-) -> str:
-    """
-    One full agentic loop turn.
-    tool_log_callback(tool_name, args, output) lets the UI show tool calls live.
-    """
-    LLMObs.annotate(
-        input_data=user_message,
-        tags={
-            **SPAN_TAGS,
-            'session.turn':   str(len([m for m in conversation if m['role'] == 'user'])),
-            'session.tools':  str(len(dd_tools)),
-        },
-    )
-
-    conversation.append({'role': 'user', 'content': [{'text': user_message}]})
-    final_answer = ''
-
-    while True:
-        body        = call_bedrock(conversation, dd_tools)
-        stop_reason = body['stopReason']
-        content     = body['output']['message']['content']
-
-        conversation.append({'role': 'assistant', 'content': content})
-
-        if stop_reason == 'end_turn':
-            final_answer = format_reply(content)
-            break
-
-        elif stop_reason == 'tool_use':
-            tool_results = []
-            for block in content:
-                if 'toolUse' in block:
-                    tu        = block['toolUse']
-                    tool_name = tu['name']
-                    tool_args = tu['input']
-                    output    = execute_mcp_tool(mcp_client, tool_name, tool_args)
-                    if tool_log_callback:
-                        tool_log_callback(tool_name, tool_args, output)
-                    tool_results.append({
-                        'toolResult': {
-                            'toolUseId': tu['toolUseId'],
-                            'content':   [{'text': output}],
-                        }
-                    })
-            conversation.append({'role': 'user', 'content': tool_results})
-
-        else:
-            final_answer = format_reply(content)
-            break
-
-    LLMObs.annotate(
-        output_data=final_answer,
-        tags={**SPAN_TAGS, 'workflow.status': 'complete'},
-    )
-    return final_answer
 
 
 # ─────────────────────────────────────────────────────────────

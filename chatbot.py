@@ -5,16 +5,23 @@ from ddtrace.llmobs.decorators import llm, tool, workflow, task
 
 load_dotenv()
 
-# ── Enable LLM Observability ─────────────────────────────────
-LLMObs.enable(
-    ml_app=os.environ['DD_LLMOBS_ML_APP'],
-    agentless_enabled=True,
-    api_key=os.environ['DD_API_KEY'],
-    site=os.environ.get('DD_SITE', 'datadoghq.com')
-)
+# ── Datadog unified service tagging (set before ddtrace uses them) ──
+os.environ.setdefault('DD_SERVICE', 'incident-aiops')
+os.environ.setdefault('DD_ENV',     os.environ.get('DD_ENV', 'dev'))
+os.environ.setdefault('DD_VERSION', '1.0.0')
+
+# ── Enable LLM Observability (idempotent — safe when imported by app.py) ──
+if not LLMObs._instance:
+    LLMObs.enable(
+        ml_app=os.environ['DD_LLMOBS_ML_APP'],
+        agentless_enabled=True,
+        api_key=os.environ['DD_API_KEY'],
+        site=os.environ.get('DD_SITE', 'datadoghq.com')
+    )
 
 bedrock = boto3.client('bedrock-runtime', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
+# ── Constants (exported so app.py can import them) ────────────
 DD_MCP_URL = 'https://mcp.datadoghq.com/api/unstable/mcp-server/mcp'
 DD_HEADERS = {
     'Content-Type': 'application/json',
@@ -22,17 +29,22 @@ DD_HEADERS = {
     'DD-APPLICATION-KEY': os.environ['DD_APP_KEY'],
 }
 
-# Model to use — Nova Micro for speed and cost efficiency
 MODEL_ID = 'amazon.nova-micro-v1:0'
 
-# Tools we want to expose from the Datadog MCP server
-# monitors/alerts  → search_datadog_monitors
-# traces           → get_apm_trace, get_apm_trace_details (or similar APM tools)
 ALLOWED_TOOLS = {
-    'search_datadog_monitors',   # monitor & alert data
-    'get_apm_traces',            # trace listing
-    'get_apm_trace_details',     # individual trace detail
-    'list_apm_services',         # supporting context for traces
+    'search_datadog_monitors',
+    'get_apm_traces',
+    'get_apm_trace_details',
+    'list_apm_services',
+}
+
+# ── Span tags applied to every LLMObs.annotate() call ─────────
+SPAN_TAGS = {
+    'env':     os.environ['DD_ENV'],
+    'service': os.environ['DD_SERVICE'],
+    'version': os.environ['DD_VERSION'],
+    'team':    'aiops',
+    'model.id': MODEL_ID,
 }
 
 
@@ -98,7 +110,8 @@ def call_bedrock(messages: list, tools: list) -> dict:
                 )
             }
             for m in messages
-        ]
+        ],
+        tags={**SPAN_TAGS, 'llm.model': MODEL_ID, 'llm.provider': 'bedrock'},
     )
 
     body_payload = {
@@ -129,20 +142,24 @@ def call_bedrock(messages: list, tools: list) -> dict:
     body = json.loads(response['body'].read())
     text_output = extract_text(body['output']['message']['content'])
     LLMObs.annotate(
-        output_data=[{'role': 'assistant', 'content': text_output or '[tool_use]'}]
+        output_data=[{'role': 'assistant', 'content': text_output or '[tool_use]'}],
+        tags={**SPAN_TAGS, 'llm.stop_reason': body.get('stopReason', 'unknown')},
     )
     return body
 
 
 # ── @tool — execute a Datadog MCP tool ───────────────────────
 @tool
-def execute_mcp_tool(client: DatadogMCPClient, name: str, args: dict) -> str:
+def execute_mcp_tool(client: 'DatadogMCPClient', name: str, args: dict) -> str:
     LLMObs.annotate(
         input_data=json.dumps(args, indent=2),
-        tags={'tool.name': name, 'tool.source': 'datadog_mcp'}
+        tags={**SPAN_TAGS, 'tool.name': name, 'tool.source': 'datadog_mcp'},
     )
     output = client.call_tool(name, args)
-    LLMObs.annotate(output_data=output)
+    LLMObs.annotate(
+        output_data=output,
+        tags={**SPAN_TAGS, 'tool.name': name, 'tool.status': 'success'},
+    )
     return output
 
 
@@ -150,14 +167,36 @@ def execute_mcp_tool(client: DatadogMCPClient, name: str, args: dict) -> str:
 @task
 def format_reply(content: list) -> str:
     text = extract_text(content)
-    LLMObs.annotate(input_data=json.dumps(content, indent=2), output_data=text)
+    LLMObs.annotate(
+        input_data=json.dumps(content, indent=2),
+        output_data=text,
+        tags={**SPAN_TAGS, 'task.name': 'format_reply'},
+    )
     return text
 
 
 # ── @workflow — one full agentic turn per user message ────────
 @workflow
-def agent_turn(user_message: str, conversation: list, mcp_client: DatadogMCPClient, dd_tools: list) -> str:
-    LLMObs.annotate(input_data=user_message)
+def agent_turn(
+    user_message: str,
+    conversation: list,
+    mcp_client: 'DatadogMCPClient',
+    dd_tools: list,
+    tool_log_callback=None,
+) -> str:
+    """
+    One full agentic turn.
+    tool_log_callback(tool_name, args, output) is called after each MCP tool
+    execution so callers (e.g. Streamlit UI) can display tool calls live.
+    """
+    LLMObs.annotate(
+        input_data=user_message,
+        tags={
+            **SPAN_TAGS,
+            'session.turn':  str(len([m for m in conversation if m['role'] == 'user'])),
+            'session.tools': str(len(dd_tools)),
+        },
+    )
 
     # Append the new user message to the shared conversation history
     conversation.append({'role': 'user', 'content': [{'text': user_message}]})
@@ -180,12 +219,14 @@ def agent_turn(user_message: str, conversation: list, mcp_client: DatadogMCPClie
             tool_results = []
             for block in content:
                 if 'toolUse' in block:
-                    tool_use = block['toolUse']
+                    tool_use  = block['toolUse']
                     tool_name = tool_use['name']
                     tool_args = tool_use['input']
                     print(f'\n  [Calling Datadog MCP tool: {tool_name}]')
                     print(f'  args: {json.dumps(tool_args, indent=4)}')
                     output = execute_mcp_tool(mcp_client, tool_name, tool_args)
+                    if tool_log_callback:
+                        tool_log_callback(tool_name, tool_args, output)
                     tool_results.append({
                         'toolResult': {
                             'toolUseId': tool_use['toolUseId'],
@@ -199,7 +240,10 @@ def agent_turn(user_message: str, conversation: list, mcp_client: DatadogMCPClie
             final_answer = format_reply(content)
             break
 
-    LLMObs.annotate(output_data=final_answer)
+    LLMObs.annotate(
+        output_data=final_answer,
+        tags={**SPAN_TAGS, 'workflow.status': 'complete'},
+    )
     return final_answer
 
 
