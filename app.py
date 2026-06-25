@@ -4,7 +4,7 @@ Datadog AIOps Chatbot powered by Amazon Nova Micro + Datadog MCP
 
 Datadog tagging strategy:
   env        → DD_ENV        (e.g. dev / staging / prod)
-  service    → DD_SERVICE    (antek-asing)
+  service    → DD_SERVICE    (incident-aiops)
   version    → DD_VERSION    (1.0.0)
   team       → custom tag    (aiops)
 
@@ -24,7 +24,7 @@ load_dotenv()
 
 # ── Datadog unified service tagging ──────────────────────────
 # Set before ddtrace initialises so every span inherits them.
-os.environ.setdefault('DD_SERVICE',  'antek-asing')
+os.environ.setdefault('DD_SERVICE',  'incident-aiops')
 os.environ.setdefault('DD_ENV',      os.environ.get('DD_ENV', 'dev'))
 os.environ.setdefault('DD_VERSION',  '1.0.0')
 
@@ -38,8 +38,8 @@ tracer.set_tags({
     'env':              os.environ['DD_ENV'],
     'service':          os.environ['DD_SERVICE'],
     'version':          os.environ['DD_VERSION'],
-    'team':             'aiops',
-    'app.name':         'antek-asing',
+    'team':             'sudo-make-me-a-sandwich',
+    'app.name':         'incident-aiops',
     'app.component':    'chatbot-ui',
     'runtime.platform': 'streamlit',
 })
@@ -76,7 +76,7 @@ SPAN_TAGS = {
     'env':           os.environ['DD_ENV'],
     'service':       os.environ['DD_SERVICE'],
     'version':       os.environ['DD_VERSION'],
-    'team':          'aiops',
+    'team':          'incident-aiops',
     'app.component': 'chatbot-ui',
     'model.id':      MODEL_ID,
     'interface':     'streamlit',
@@ -112,7 +112,7 @@ class DatadogMCPClient:
         self._post('initialize', {
             'protocolVersion': '2024-11-05',
             'capabilities': {},
-            'clientInfo': {'name': 'antek-asing-ui', 'version': '1.0'},
+            'clientInfo': {'name': 'incident-aiops-ui', 'version': '1.0'},
         })
 
     def list_tools(self) -> list:
@@ -423,16 +423,16 @@ with st.sidebar:
     # ── Datadog environment tags (visible to operator) ────────
     st.markdown('**Datadog Tags**')
     env_val     = os.environ.get('DD_ENV',     'dev')
-    svc_val     = os.environ.get('DD_SERVICE', 'antek-asing')
+    svc_val     = os.environ.get('DD_SERVICE', 'incident-aiops')
     ver_val     = os.environ.get('DD_VERSION', '1.0.0')
-    ml_app_val  = os.environ.get('DD_LLMOBS_ML_APP', 'antek-asing')
+    ml_app_val  = os.environ.get('DD_LLMOBS_ML_APP', 'incident-aiops')
 
     st.markdown(f"""
     <span class="tag-pill tag-pill-green">env:{env_val}</span>
     <span class="tag-pill tag-pill-purple">service:{svc_val}</span>
     <span class="tag-pill tag-pill-orange">version:{ver_val}</span>
     <span class="tag-pill">ml_app:{ml_app_val}</span>
-    <span class="tag-pill">team:aiops</span>
+    <span class="tag-pill">team:incident-aiops</span>
     <span class="tag-pill">model:nova-micro</span>
     <span class="tag-pill">interface:streamlit</span>
     """, unsafe_allow_html=True)
